@@ -30,10 +30,14 @@ import os
 import sys
 from glob import glob
 from datetime import datetime, timedelta
-from urlparse import urlunsplit
+try:
+    from urllib.parse import urlunsplit
+except ImportError:
+    from urlparse import urlunsplit
 import socket
 import netifaces
 
+import posttroll.subscriber
 from active_fires import get_config
 
 #: Default time format
@@ -228,20 +232,20 @@ def get_arguments():
     args = parser.parse_args()
 
     if args.config_file == '':
-        print "Configuration file required! viirs_af_runner.py <file>"
+        print("Configuration file required! viirs_af_runner.py <file>")
         sys.exit()
     if args.environment == '':
-        print "Environment required! Use command-line switch -s <service name>"
+        print("Environment required! Use command-line switch -s <service name>")
         sys.exit()
     if args.service == '':
-        print "Service required! Use command-line switch -e <environment>"
+        print("Service required! Use command-line switch -e <environment>")
         sys.exit()
 
     service = args.service.lower()
     environment = args.environment.lower()
 
     if 'template' in args.config_file:
-        print "Template file given as master config, aborting!"
+        print("Template file given as master config, aborting!")
         sys.exit()
 
     return environment, service, args.config_file, args.nagios_file
