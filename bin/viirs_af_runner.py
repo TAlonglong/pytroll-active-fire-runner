@@ -34,17 +34,18 @@ import posttroll.subscriber
 from posttroll.publisher import Publish
 from posttroll.message import Message
 import socket
-import netifaces
 import six
 import time
-from datetime import datetime
-import shutil
-import stat
+
+from active_fires.utils import (deliver_output_files, get_local_ips, cleanup_cspp_workdir,
+                                get_edr_times, get_active_fire_result_files)
 
 if six.PY2:
     from urlparse import urlparse
+    from urlparse import urlunsplit
 elif six.PY3:
     from urllib.parse import urlparse
+    from urllib.parse import urlunsplit
 
 if six.PY2:
     ptimer = time.clock
@@ -61,72 +62,6 @@ PATH = os.environ.get('PATH', '')
 
 CSPP_AF_HOME = os.environ.get("CSPP_ACTIVE_FIRE_HOME", '')
 CSPP_AF_WORKDIR = os.environ.get("CSPP_ACTIVE_FIRE_WORKDIR", '')
-# APPL_HOME = os.environ.get('NPP_SDRPROC', '')
-
-
-def deliver_output_files(affiles, base_dir, subdir=None):
-    """Copy the Active Fire output files to the sub-directory under the *subdir* directory
-    structure"""
-
-    if subdir:
-        path = os.path.join(base_dir, subdir)
-    else:
-        path = base_dir
-
-    if not os.path.exists(path):
-        os.mkdir(path)
-
-    LOG.info("Number of Active Fire result files: " + str(len(affiles)))
-    retvl = []
-    for affile in affiles:
-        newfilename = os.path.join(path, os.path.basename(affile))
-        LOG.info("Copy affile to destination: " + newfilename)
-        if os.path.exists(affile):
-            LOG.info("File to copy: {file} <> ST_MTIME={time}".format(file=str(affile),
-                                                                      time=datetime.utcfromtimestamp(os.stat(affile)[stat.ST_MTIME]).strftime('%Y%m%d-%H%M%S')))
-        shutil.copy(affile, newfilename)
-        if os.path.exists(newfilename):
-            LOG.info("File at destination: {file} <> ST_MTIME={time}".format(file=str(newfilename),
-                                                                             time=datetime.utcfromtimestamp(os.stat(newfilename)[stat.ST_MTIME]).strftime('%Y%m%d-%H%M%S')))
-
-        retvl.append(newfilename)
-
-    return retvl
-
-
-def get_local_ips():
-    inet_addrs = [netifaces.ifaddresses(iface).get(netifaces.AF_INET)
-                  for iface in netifaces.interfaces()]
-    ips = []
-    for addr in inet_addrs:
-        if addr is not None:
-            for add in addr:
-                ips.append(add['addr'])
-    return ips
-
-
-def cleanup_cspp_workdir(workdir):
-    """Clean up the CSPP working dir after processing"""
-
-    filelist = glob('%s/*' % workdir)
-    dummy = [os.remove(s) for s in filelist if os.path.isfile(s)]
-    filelist = glob('%s/*' % workdir)
-    LOG.info(
-        "Number of items left after cleaning working dir = " + str(len(filelist)))
-    shutil.rmtree(workdir)
-    return
-
-
-def get_active_fire_result_files(res_dir):
-    """
-    Make alist of all result files that should be captured from the CSPP
-    work-dir for delivery
-    """
-
-    result_files = (glob(os.path.join(res_dir, 'AF*.nc')) +
-                    glob(os.path.join(res_dir, 'AF*.txt')))
-
-    return sorted(result_files)
 
 
 class ViirsActiveFiresProcessor(object):
@@ -147,7 +82,10 @@ class ViirsActiveFiresProcessor(object):
         self.pass_start_time = None
         self.result_files = []
         self.sdr_files = []
-        self.result_home = OPTIONS['output_dir']
+        self.result_home = OPTIONS.get('output_dir')
+        self.publish_topic = OPTIONS.get('publish_topic')
+        self.site = OPTIONS.get('site', 'unknown')
+        self.environment = OPTIONS.get('environment')
         self.message_data = None
 
     def initialise(self):
@@ -229,14 +167,56 @@ def spawn_cspp(sdrfiles):
     return working_dir, result_files
 
 
-def publish_sdr(publisher, result_files, mda, **kwargs):
+def publish_af(publisher, result_files, mda, **kwargs):
     """Publish the messages that SDR files are ready
     """
     if not result_files:
         return
 
     # Now publish:
-    LOG.info("Here we should publish the results...")
+    to_send = mda.copy()
+    # Delete the SDR dataset from the message:
+    try:
+        del(to_send['dataset'])
+    except KeyError:
+        LOG.warning("Couldn't remove dataset from message")
+
+    if 'orbit' in kwargs:
+        to_send["orig_orbit_number"] = to_send["orbit_number"]
+        to_send["orbit_number"] = kwargs['orbit']
+
+    to_send["dataset"] = []
+    for result_file in result_files:
+        filename = os.path.basename(result_file)
+        to_send[
+            'dataset'].append({'uri': urlunsplit(('ssh', socket.gethostname(),
+                                                  result_file, '', '')),
+                               'uid': filename})
+
+    publish_topic = kwargs.get('publish_topic', 'Unknown')
+    site = kwargs.get('site', 'unknown')
+    environment = kwargs.get('environment', 'unknown')
+
+    to_send['format'] = 'EDR'
+    to_send['type'] = 'NETCDF'
+    to_send['data_processing_level'] = '2'
+    to_send['start_time'], to_send['end_time'] = get_edr_times(filename)
+
+    LOG.debug('Site = %s', site)
+    LOG.debug('Publish topic = %s', publish_topic)
+    for topic in publish_topic:
+        msg = Message('/'.join(('',
+                                topic,
+                                to_send['format'],
+                                to_send['data_processing_level'],
+                                site,
+                                environment,
+                                'polar',
+                                'direct_readout')),
+                      "dataset", to_send).encode()
+
+    LOG.debug("sending: " + str(msg))
+    publisher.send(msg)
 
 
 def viirs_active_fire_runner(options, service_name):
@@ -272,19 +252,14 @@ def viirs_active_fire_runner(options, service_name):
                     af_files = viirs_af_proc.deliver_output_files()
                     LOG.info("Cleaning up directory %s", working_dir)
                     cleanup_cspp_workdir(working_dir)
-                    publish_sdr(publisher, af_files,
-                                viirs_af_proc.message_data,
-                                orbit=viirs_af_proc.orbit_number)
+                    publish_af(publisher, af_files,
+                               viirs_af_proc.message_data,
+                               orbit=viirs_af_proc.orbit_number,
+                               publish_topic=viirs_af_proc.publish_topic,
+                               environment=viirs_af_proc.environment,
+                               site=viirs_af_proc.site)
 
                 LOG.info("Now that SDR processing has completed.")
-
-    # #viirs_sdr_dir = "/data/temp/AdamD/xxx/noaa20_20190423_0205_07388"
-    # #viirs_sdr_dir = "/data/temp/AdamD/xxx/noaa20_20190423_1017_07393"
-    # viirs_sdr_dir = "/data/lang/proj/safworks/fires2019/npp_20190424_1046_38804/"
-    # if service_name == "viirs-mbands":
-    #     run_cspp_viirs_af(viirs_sdr_dir, mbands=True)
-    # elif service_name == "viirs-ibands":
-    #     run_cspp_viirs_af(viirs_sdr_dir, mbands=False)
 
     return
 
