@@ -5,7 +5,7 @@
 
 # Author(s):
 
-#   Adam.Dybbroe <adam.dybbroe@smhi.se>
+#   Adam Dybbroe <Firstname.Lastname@smhi.se>
 
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -28,7 +28,6 @@ Fire outputs on I- and/or M-bands.
 import logging
 import os
 import sys
-from glob import glob
 from active_fires import get_config
 import posttroll.subscriber
 from posttroll.publisher import Publish
@@ -82,20 +81,25 @@ class ViirsActiveFiresProcessor(object):
         self.pass_start_time = None
         self.result_files = []
         self.sdr_files = []
-        self.result_home = OPTIONS.get('output_dir')
+        self.result_home = OPTIONS.get('output_dir', '/tmp')
         self.publish_topic = OPTIONS.get('publish_topic')
         self.site = OPTIONS.get('site', 'unknown')
         self.environment = OPTIONS.get('environment')
         self.message_data = None
+        self.service = None
 
-    def initialise(self):
+    def initialise(self, service):
         """Initialise the processor"""
         self.cspp_results = []
         self.pass_start_time = None
         self.result_files = []
         self.sdr_files = []
+        self.service = service
 
     def deliver_output_files(self, subd=None):
+        LOG.debug("Result files: %s", str(self.result_files))
+        LOG.debug("Result home dir: %s", str(self.result_home))
+        LOG.debug("Sub directory: %s", subd)
         return deliver_output_files(self.result_files, self.result_home, subd)
 
     def run(self, msg):
@@ -144,16 +148,16 @@ class ViirsActiveFiresProcessor(object):
 
         self.sdr_files = sdr_files
 
-        self.cspp_results.append(self.pool.apply_async(spawn_cspp, (self.sdr_files, )))
+        self.cspp_results.append(self.pool.apply_async(spawn_cspp, (self.sdr_files, self.service)))
         LOG.debug("Inside run: Return with a False...")
         return False
 
 
-def spawn_cspp(sdrfiles):
+def spawn_cspp(sdrfiles, service):
     """Spawn a CSPP AF run on the set of SDR files given"""
 
     LOG.info("Start CSPP: SDR files = " + str(sdrfiles))
-    working_dir = run_cspp_viirs_af(sdrfiles)
+    working_dir = run_cspp_viirs_af(sdrfiles, service)
     LOG.info("CSPP SDR Active Fires processing finished...")
     # Assume everything has gone well!
 
@@ -236,8 +240,9 @@ def viirs_active_fire_runner(options, service_name):
         with Publish('viirs_active_fire_runner', 0) as publisher:
 
             while True:
-                viirs_af_proc.initialise()
-                for msg in subscr.recv(timeout=300):
+                viirs_af_proc.initialise(service_name)
+                # for msg in subscr.recv(timeout=300):
+                for msg in subscr.recv():
                     status = viirs_af_proc.run(msg)
                     if not status:
                         break  # end the loop and reinitialize !
@@ -259,12 +264,12 @@ def viirs_active_fire_runner(options, service_name):
                                environment=viirs_af_proc.environment,
                                site=viirs_af_proc.site)
 
-                LOG.info("Now that SDR processing has completed.")
+                LOG.info("SDR processing has completed.")
 
     return
 
 
-def run_cspp_viirs_af(viirs_sdr_files, mbands=True):
+def run_cspp_viirs_af(viirs_sdr_files, service):
     """A wrapper for the CSPP VIIRS Active Fire algorithm"""
 
     from subprocess import Popen, PIPE, STDOUT
@@ -279,13 +284,14 @@ def run_cspp_viirs_af(viirs_sdr_files, mbands=True):
 
     cmdlist = [viirs_af_call]
     cmdlist.extend(['-d', '-W', working_dir, '--num-cpu', '%d' % int(OPTIONS.get('num_of_cpus', 4))])
-    if mbands:
+    if service == 'viirs-mbands':
         cmdlist.extend(['-M'])
-        #cmdlist.extend(glob(os.path.join(viirs_sdr_dir, 'GMTCO*.h5')))
-    else:
+        LOG.info("M-bands: %s", service)
+    elif service == 'viirs-ibands':
         # I-bands:
-        # cmdlist.extend([viirs_sdr_dir])
-        pass
+        LOG.info("I-bands %s", service)
+    else:
+        LOG.warning("Service not recognized: %s - Assume I-bands", service)
 
     cmdlist.extend(viirs_sdr_files)
 
